@@ -1,1 +1,471 @@
-analysis.Rmd
+---
+title: "Capstone Analysis"
+author: "Jonathan Dayton"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Open libraries
+
+```{r}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(ggthemes)
+library(stringr)
+library(tidyverse)
+```
+
+# Read in data
+
+```{r}
+bwaData <- read_tsv("genes.bwa.tsv")
+bwaFilteredData <- read_tsv("genes.bwa.filtered.tsv")
+kallistoData <- read_tsv("genes.kallisto.tsv")
+```
+
+# Define function to parse out important values in the data
+
+```{r}
+getGeneData <- function(x) {
+  x %>% 
+    separate(transcript, into=c('a','b','c','d','variant','gene','g','h','i'), sep="\\|") %>%
+    select(id, type, variant, gene, tpm) %>% 
+    return()
+}
+```
+
+
+# Get a short Variant ID from the Transcript column
+
+```{r}
+bwaData <- getGeneData(bwaData)
+bwaFilteredData <- getGeneData(bwaFilteredData)
+kallistoData <- getGeneData(kallistoData)
+```
+
+# Function to spread the data, run PCA, and plot it
+
+```{r}
+pcaPlot <- function(x, title="") {
+  spreadData <- x %>% 
+    filter(tpm > 0) %>% 
+    select(id, type, variant, tpm) %>% 
+    spread(variant, tpm)
+
+  spreadData[is.na(spreadData)] <- 0
+  pcaMatrix <- spreadData %>% select(-id, -type) %>% as.matrix()
+  pcaMatrix <- pcaMatrix + 1
+  pcaMatrix <- pcaMatrix %>% log10()
+  
+  pc <- pcaMatrix %>% prcomp()
+  
+  pc$x %>% 
+  data.frame(id=spreadData$id, type=spreadData$type) %>% 
+  as.tbl() %>% 
+  # select(PC1, PC2, type) %>%
+  ggplot(aes(x=PC1, y=PC2, color=type)) +
+    geom_point() +
+    ggtitle(title)
+}
+```
+
+# Function to normalize the data
+
+### Normalization: For each gene for each sample, sum the total tpm for all transcripts & adjust the transcript tpm to a percentage of the total.
+
+```{r}
+normalizeData <- function(x) {
+  sumData <- x %>% 
+    unite(sample, c(id, type), sep="|") %>% 
+    group_by(gene, sample) %>% 
+    summarize(tpm_sum=sum(tpm)) %>% 
+    separate(sample, into=c('id', 'type'), sep="\\|") %>% 
+    select(id, type, gene, tpm_sum)
+  sumData$id <- as.integer(sumData$id)
+  
+  normalized <- x %>% inner_join(sumData, by=c("id", "type", "gene"))
+  normalized$tpm_norm <- normalized$tpm / normalized$tpm_sum
+  normalized <- select(normalized, id, type, variant, gene, tpm_norm)
+  
+  return(normalized)
+}
+```
+
+# Chart the principal components
+
+```{r}
+bwaData %>% pcaPlot(title="BWA-MEM, not normalized")
+bwaFilteredData %>% pcaPlot(title="BWA-MEM Filtered, not normalized")
+kallistoData %>% pcaPlot(title="Kallisto, not normalized")
+
+bwaNormalized <- normalizeData(bwaData)
+bwaFilteredNormalized <- normalizeData(bwaFilteredData)
+kallistoNormalized <- normalizeData(kallistoData)
+
+bwaNormalized %>% rename(tpm = tpm_norm) %>% pcaPlot(title="BWA-MEM, normalized")
+bwaFilteredNormalized %>% rename(tpm = tpm_norm) %>% pcaPlot(title="BWA-MEM Filtered, normalized")
+kallistoNormalized %>% rename(tpm = tpm_norm) %>% pcaPlot(title="Kallisto, normalized")
+
+```
+
+# Try some classification algorithms...
+
+Barplots -- 
+
+Try t-tests...
+  for each variant
+    (plot) plot range for PD vs range for Baseline
+    compare average TPM for PD vs Baseline
+
+It would be cool to apply a decision tree to this and see what it thinks are the main differences between the two classes. 
+
+# How much is each transcript expressed? (Boxplots)
+
+# TODO: try not normalizing the data; also show the data points as well as the box plots.
+
+```{r}
+plots = list()
+
+variants <- bwaNormalized$variant %>% unique() %>% sort()
+
+for (thisVariant in variants) {
+  group <- bwaNormalized %>% 
+    filter(variant %in% thisVariant)
+  pd <- group %>% 
+    filter(type %in% "PD")
+  pd <- pd$tpm_norm
+  baseline <- group %>%
+    filter(type %in% "Baseline")
+  baseline <- baseline$tpm_norm
+  p_val <- t.test(baseline, pd)$p.value
+  # Adjust for multiple comparisons
+  p_val <- p.adjust(p_val, "fdr", n=length(variants)) %>% round(digits=3)
+  p_lab <- c("FDR adjusted p = ", p_val) %>% paste(collapse="")
+  p <- bwaNormalized %>% 
+    filter(variant %in% thisVariant) %>% 
+    ggplot(aes(type, tpm_norm)) + 
+      geom_boxplot() +
+      ggtitle(thisVariant) +
+      ylab("Normalized TPM") + 
+      xlab(p_lab) +
+      geom_point(position=position_jitter(width=0.2, height=0))
+  if (!is.na(p_val) && p_val < 1)
+  {
+    plots <- append(plots, list(p))
+  }
+  print(p)
+}
+```
+
+# Multiplot function, taken from [here](http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/)
+
+```{r}
+# Multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+# The plots that are more significant than p = 1.
+
+# TODO: figure out.. do we need to take the NaN values into account when correcting the p values?
+
+```{r}
+multiplot(plots[[2]], plots[[3]], plots[[4]], plots[[5]], cols=2)
+```
+
+
+# Do some bar plots
+
+
+```{r}
+plotBaselineVsPD <- function(x, title="") {
+  x %>%
+    group_by(variant, type) %>% 
+    summarize(avg_norm_tpm=mean(tpm)) %>% 
+    ggplot(aes(x=variant, y=avg_norm_tpm, fill=type)) + 
+      geom_bar(stat="identity", position="dodge") + 
+      coord_flip() +
+      ggtitle(title) +
+      ylab("Average Normalized TPM")
+}
+
+bwaNormalized %>%
+  rename(tpm=tpm_norm) %>%
+  plotBaselineVsPD(title="BWA")
+
+bwaFilteredNormalized %>%
+  rename(tpm=tpm_norm) %>%
+  plotBaselineVsPD(title="BWA Filtered")
+
+kallistoNormalized %>%
+  rename(tpm=tpm_norm) %>%
+  plotBaselineVsPD(title="Kallisto")
+# TODO: do the same thing for kallisto & for bwa-filtered.
+# TODO: see if there's a difference just for genes.. Like PD-EGFR vs Baseline-EGFR
+```
+```{r}
+barPlotStuff <- function(x, y, x_name="BWA", y_name="Kallisto") {
+  x <- x %>% 
+    group_by(variant) %>%
+    summarize(mean_norm_tpm=mean(tpm))
+  x$Alignment = x_name
+  y <- y %>%
+    group_by(variant) %>%
+    summarize(mean_norm_tpm=mean(tpm))
+  y$Alignment = y_name
+  dataTbl <- rbind(x, y)
+  dataTbl %>% 
+    ggplot(aes(x=variant, y=mean_norm_tpm, fill=Alignment)) +
+      geom_bar(stat="identity", position="dodge") + 
+      coord_flip() +
+      ylab("Mean Normalized TPM") + 
+      xlab("Variant")
+}
+```
+
+# BWA vs Kallisto
+
+```{r}
+x <- bwaNormalized %>% rename(tpm=tpm_norm)
+y <- kallistoNormalized %>% rename(tpm=tpm_norm)
+barPlotStuff(x, y)
+```
+
+# BWA vs BWA Filtered
+
+```{r}
+x <- bwaNormalized %>% rename(tpm=tpm_norm)
+y <- bwaFilteredNormalized %>% rename(tpm=tpm_norm)
+barPlotStuff(x, y, x_name="BWA", y_name="BWA Filtered")
+```
+
+# Permute the data to get a null distribution -- do this with non-normalized data
+
+```{r}
+getPermutedNullDistribution <- function(x, n=10000, seed=0) {
+  # This function will only work for this data :)
+  set.seed(seed)
+  # Get the variants that aren't all zero
+  useVariants <- x %>% 
+    group_by(variant) %>% 
+    summarize(sum=sum(tpm)) %>% 
+    filter(sum > 0) %>% 
+    collect %>% 
+    .[["variant"]]
+  
+  # Spread the data out
+  spreadData <- x %>% 
+    filter(variant %in% useVariants) %>%
+    select(id, type, variant, tpm) %>% 
+    spread(variant, tpm) %>% 
+    select(-id)
+    
+  # Count the number of PD & the number of Baseline
+  numBaseline <- spreadData %>% filter(type %in% "Baseline") %>% nrow()
+  numPD <- spreadData %>% filter(type %in% "PD") %>% nrow()
+  
+  # The differences of means, Baseline - PD
+  differences = read.table(text="", col.names=useVariants) %>% as.tbl()
+  
+  for (i in 1:n) {
+    # Pick samples in a random order, assign classes to them, 
+    # and calculate the differences in mean Baseline - PD for
+    # each variant.
+    classes <- c(rep("Baseline", numBaseline), rep("PD", numPD))
+    sampled <- spreadData %>% sample_n(30, replace=FALSE)
+    sampled$type <- classes
+    means <- sampled %>% group_by(type) %>% summarise_each(funs(mean))
+    # Transpose it
+    means <- means %>% gather(var, val, -type) %>% spread(type, val)
+    differences[i,] <- means$Baseline - means$PD
+  }
+  
+  return(differences)
+}
+```
+
+# Think about mapping each variant to the exons that are in that variant and somehow displaying that.  
+
+# Get the null distribution table
+
+```{r}
+nullDistNorm <- getPermutedNullDistribution(x, n=10000)
+```
+
+# Get the difference in means Baseline - PD for a given variant and dataset
+
+```{r}
+getMeanDiff <- function(x, var) {
+  # Get mean for Baseline
+  meanBaseline <- x %>%
+    filter(variant %in% var, type %in% "Baseline") %>%
+    collect %>% .[["tpm"]] %>% 
+    mean()
+  # Get mean for PD
+  meanPD <- x %>%
+    filter(variant %in% var, type %in% "PD") %>%
+    collect %>% .[["tpm"]] %>%
+    mean()
+  # Return the difference
+  return(meanBaseline - meanPD)
+}
+```
+
+# How significant is the difference in the ERBB2-001 variant?
+
+```{r}
+nullDistBwa <- getPermutedNullDistribution(bwaData, n=10000)
+```
+```{r}
+theDiff <- getMeanDiff(bwaData, "ERBB2-001")
+nullDistBwa$ERBB2.001 %>% hist()
+nullDistBwa %>% 
+  ggplot(aes(ERBB2.001)) + 
+  geom_histogram() + 
+  geom_vline(xintercept = theDiff, color="red", linetype="dashed")
+```
+
+```{r}
+theDiff <- bwaNormalized %>% rename(tpm=tpm_norm) %>% getMeanDiff("ERBB2-001")
+thePVal <- (sum(nullDistNorm$ERBB2.001 > theDiff) + 1) / (length(nullDistNorm$ERBB2.001) + 1)
+thePVal <- p.adjust(thePVal, "bonferroni", n=ncol(nullDistNorm)) %>% round(digits=3)
+thePVal <- paste(c("Bonferroni-adjusted p=", round(thePVal, 7)), collapse="")
+nullDistNorm %>% ggplot(aes(nullDistNorm[["ERBB2.001"]])) +
+  geom_histogram() + 
+  geom_vline(xintercept = theDiff, color="red", linetype="dashed") +
+  labs(title="ERBB2.001", x=thePVal, y="Frequency")
+```
+
+```{r}
+plots = list()
+histograms = list()
+
+variants <- bwaNormalized %>% 
+  filter(tpm_norm > 0) %>% 
+  collect %>% .[["variant"]] %>% 
+  unique() %>% 
+  sort()
+
+# Set a counter to use for the plots
+i <- 1
+
+for (thisVariant in variants) {
+  group <- bwaNormalized %>% 
+    filter(variant %in% thisVariant)
+  pd <- group %>% 
+    filter(type %in% "PD")
+  pd <- pd$tpm_norm
+  baseline <- group %>%
+    filter(type %in% "Baseline")
+  baseline <- baseline$tpm_norm
+  p_val <- t.test(baseline, pd)$p.value
+  
+  # Calculate p value
+  theDiff <- bwaNormalized %>% rename(tpm=tpm_norm) %>% getMeanDiff(thisVariant)
+  #Get mean of null dist
+  thisVariantWithDot <- str_replace(thisVariant,"\\-",".")
+  nullDistMean <- mean(nullDistNorm[[thisVariantWithDot]])
+  # Figure out which side of the mean theDiff is on, and calc thePVal accordingly
+  if (theDiff < nullDistMean) {
+    thePVal <- (sum(nullDistNorm[[thisVariantWithDot]] < theDiff) + 1) / (length(nullDistNorm[[thisVariantWithDot]]) + 1)
+  } else {
+    thePVal <- (sum(nullDistNorm[[thisVariantWithDot]] > theDiff) + 1) / (length(nullDistNorm[[thisVariantWithDot]]) + 1)
+  }
+  thePVal <- p.adjust(thePVal, "bonferroni", n=ncol(nullDistNorm)) %>% round(digits=3)
+  p_lab <- paste(c("Bonferroni-adjusted p=", round(thePVal, 7)), collapse="")
+  
+  # Get histograms
+  h <- nullDistNorm %>% ggplot(aes(nullDistNorm[[thisVariantWithDot]])) +
+    geom_histogram(bins=30) + 
+    geom_vline(xintercept = theDiff, color="red", linetype="dashed") +
+    labs(title=thisVariant, x=p_lab, y="Frequency")
+  
+  # Get box plots
+  p <- bwaNormalized %>% 
+    filter(variant %in% thisVariant) %>% 
+    ggplot(aes(type, tpm_norm)) + 
+      geom_boxplot() +
+      ggtitle(thisVariant) +
+      ylab("Normalized TPM") + 
+      xlab(p_lab) +
+      geom_point(position=position_jitter(width=0.2, height=0))
+  if (!is.na(thePVal) && thePVal < 1)
+  {
+    plots[[i]] <- p
+    histograms[[i]] <- list(h)
+    i <- i + 1
+  }
+  print(h)
+  print(p)
+}
+```
+
+```{r}
+multiplot(plots[[5]], plots[[8]], plots[[11]], plots[[3]], cols=2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+5 3 8 11 
+
+
+
+
+
+
+
+
